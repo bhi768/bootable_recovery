@@ -21,6 +21,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -175,20 +176,8 @@ static void* StartSdcardFuse(const std::string& path) {
   return t;
 }
 
-static void FinishSdcardFuse(void* cookie) {
-  if (cookie == NULL) return;
-  token* t = reinterpret_cast<token*>(cookie);
-
-  // Calling stat() on this magic filename signals the fuse
-  // filesystem to shut down.
-  struct stat st;
-  stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &st);
-
-  pthread_join(t->th, nullptr);
-  delete t;
-}
-
-int ApplyFromSdcard(Device* device, RecoveryUI* ui) {
+int ApplyFromSdcard(Device* device, RecoveryUI* ui,
+                    const std::function<bool(Device*)>& ask_to_continue_unverified_fn) {
   if (ensure_path_mounted(SDCARD_ROOT) != 0) {
     LOG(ERROR) << "\n-- Couldn't mount " << SDCARD_ROOT << ".\n";
     return INSTALL_ERROR;
@@ -206,9 +195,63 @@ int ApplyFromSdcard(Device* device, RecoveryUI* ui) {
 
   ui->Print("\n-- Install %s ...\n", path.c_str());
   SetSdcardUpdateBootloaderMessage();
-  void* token = StartSdcardFuse(path);
-  int status = install_package(FUSE_SIDELOAD_HOST_PATHNAME, false, false, 0 /*retry_count*/, ui);
-  FinishSdcardFuse(token);
+
+  // We used to use fuse in a thread as opposed to a process. Since accessing
+  // through fuse involves going from kernel to userspace to kernel, it leads
+  // to deadlock when a page fault occurs. (Bug: 26313124)
+  pid_t child;
+  if ((child = fork()) == 0) {
+    bool status = StartSdcardFuse(path);
+
+    _exit(status ? EXIT_SUCCESS : EXIT_FAILURE);
+  }
+
+  // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the fuse in child
+  // process is ready.
+  int result = INSTALL_ERROR;
+  int status;
+  bool waited = false;
+  for (int i = 0; i < SDCARD_INSTALL_TIMEOUT; ++i) {
+    if (waitpid(child, &status, WNOHANG) == -1) {
+      result = INSTALL_ERROR;
+      waited = true;
+      break;
+    }
+
+    struct stat sb;
+    if (stat(FUSE_SIDELOAD_HOST_PATHNAME, &sb) == -1) {
+      if (errno == ENOENT && i < SDCARD_INSTALL_TIMEOUT - 1) {
+        sleep(1);
+        continue;
+      } else {
+        LOG(ERROR) << "Timed out waiting for the fuse-provided package.";
+        result = INSTALL_ERROR;
+        kill(child, SIGKILL);
+        break;
+      }
+    }
+
+    result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, false, false, 0 /*retry_count*/,
+                             true /* verify */, ui);
+    if (result == INSTALL_UNVERIFIED && ask_to_continue_unverified_fn(device)) {
+      result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, false, false, 0 /*retry_count*/,
+                               false /* verify */, ui);
+    }
+    break;
+  }
+
+  if (!waited) {
+    // Calling stat() on this magic filename signals the fuse
+    // filesystem to shut down.
+    struct stat sb;
+    stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &sb);
+
+    waitpid(child, &status, 0);
+  }
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    LOG(ERROR) << "Error exit from the fuse process: " << WEXITSTATUS(status);
+  }
 
   ensure_path_unmounted(SDCARD_ROOT);
   return status;
