@@ -447,6 +447,12 @@ int main(int argc, char** argv) {
   std::thread listener_thread(ListenRecoverySocket, ui, std::ref(action));
   listener_thread.detach();
 
+  // Set up adb_keys and enable root before starting ADB.
+  if (is_ro_debuggable() && !fastboot) {
+    copy_userdata_files();
+    android::base::SetProperty("candy.service.adb.root", "1");
+  }
+
   while (true) {
     std::string usb_config = fastboot ? "fastboot" : is_ro_debuggable() ? "adb" : "none";
     std::string usb_state = android::base::GetProperty("sys.usb.state", "none");
